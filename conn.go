@@ -7,7 +7,7 @@ var (
 	ErrClosed = errors.New("pool is closed")
 )
 
-type Conn interface{
+type Conn interface {
 	Close()
 }
 

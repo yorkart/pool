@@ -2,46 +2,46 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
 )
 
 // ConnectionPool connection pool manager
 type Pool struct {
-	waitings  int32
-	hits      int64
+	waitings int32
+	hits     int64
 
 	available bool
 
-	cap    int
-	maxCap int
-	queue chan Conn
+	cap     int
+	queue   chan Conn
+	hitTS int64
 
 	factory Factory
+	conf    *Config
 
 	lock *sync.Mutex
 }
 
 // NewPool create ConnectionPool instance
-func NewPool(initialCap, maxCap int, factory Factory) (*Pool,error) {
-	if initialCap < 0 || maxCap <= 0 || initialCap > maxCap {
-		return nil, errors.New("invalid capacity settings")
+func NewPool(conf *Config, factory Factory) (*Pool, error) {
+	confCopy, err := conf.copy()
+	if err != nil {
+		return nil, err
 	}
 
 	p := &Pool{
-		available: false,
+		queue: make(chan Conn, confCopy.MaxCap),
 
-		queue: make(chan Conn, maxCap),
-		maxCap : maxCap,
-
-		factory:   factory,
+		factory: factory,
+		conf:    confCopy,
 
 		lock: &sync.Mutex{},
 	}
 
-	for i := 0; i < initialCap; i++ {
+	for i := 0; i < p.conf.InitialCap; i++ {
 		_, err := p.create()
 		if err != nil {
 			return nil, fmt.Errorf("factory is not able to fill the pool: %s", err)
@@ -49,7 +49,7 @@ func NewPool(initialCap, maxCap int, factory Factory) (*Pool,error) {
 	}
 
 	go p.idleCheck()
-
+	p.available = true
 	return p, nil
 }
 
@@ -58,7 +58,7 @@ func (p *Pool) create() (Conn, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	if len(p.queue) >= p.maxCap {
+	if len(p.queue) >= p.conf.MaxCap {
 		return nil, errors.New("pool is full")
 	}
 
@@ -68,24 +68,24 @@ func (p *Pool) create() (Conn, error) {
 		return nil, fmt.Errorf("create connection error: %s", err)
 	}
 
-	if err = p.add(c);err != nil {
-		return nil ,err
+	if err = p.add(c); err != nil {
+		return nil, err
 	}
-	p.cap ++
+	p.cap++
 	return c, nil
 }
 
-func (p *Pool) add(c Conn) error{
+func (p *Pool) add(c Conn) error {
 	select {
-	case p.queue<-c :
+	case p.queue <- c:
 		return nil
-	default :
+	default:
 		c.Close()
 		return errors.New("pool is full")
 	}
 }
 
-func (p *Pool) get() (Conn, error){
+func (p *Pool) get() (Conn, error) {
 	select {
 	case c := <-p.queue:
 		if c == nil {
@@ -107,17 +107,19 @@ func (p *Pool) Checkout() (Conn, error) {
 		return nil, ErrClosed
 	}
 
-	c, err := p.get();
-	if  err != nil {
-		return nil,err
+	c, err := p.get()
+	if err != nil {
+		return nil, err
 	}
 
-	atomic.AddInt32(&p.hits, 1)
+	atomic.AddInt64(&p.hits, 1)
+	atomic.StoreInt64(&p.hitTS, time.Now().Unix())
+
 	return c, nil
 }
 
 // Checkin give back client session
-func (p *Pool) Checkin(c Conn) error{
+func (p *Pool) Checkin(c Conn) error {
 	if c == nil {
 		return errors.New("connection is nil. rejecting")
 	}
@@ -135,8 +137,12 @@ func (p *Pool) Close() {
 	}
 	p.available = false
 
-	for i:=0; i< p.maxCap; i++ {
-		c := <- p.queue
+	for i := 0; i < p.cap; i++ {
+		c,err := p.Checkout()
+		if err != nil {
+			i--
+			continue
+		}
 		c.Close()
 	}
 
@@ -147,55 +153,5 @@ func (p *Pool) Close() {
 // Destroy close a client session
 func (p *Pool) destroy(c Conn) {
 	c.Close()
-	p.cap --
-}
-
-func (p *Pool) idleCheck() {
-	for {
-		if !p.available {
-			break
-		}
-		p.tryRelease()
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func (p *Pool) tryRelease() {
-	if !p.canRelease() {
-		return
-	}
-
-	if client, err := p.Checkout(); err == nil && client != nil {
-		p.release(client)
-	} else {
-		p.Checkin(client)
-	}
-}
-
-func (p *Pool) canRelease() bool {
-	cap := int(p.cap)
-	len := len(p.queue)
-
-	if cap < 3 {
-		return false
-	}
-
-	if len > int(float32(cap)*0.5) {
-		return true
-	}
-	return false
-}
-
-func (p *Pool) release(c Conn) bool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	if !p.available {
-		return false
-	}
-
-	p.destroy(c)
-
-
-	return true
+	p.cap--
 }
